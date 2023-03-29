@@ -17,6 +17,7 @@
 
 //! Ballista Executor Process
 
+use std::convert::TryInto;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -34,6 +35,8 @@ use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::{fs, time};
+use tonic::codegen::StdError;
+use tonic::transport::{Channel, Endpoint, Server};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -88,6 +91,75 @@ pub struct ExecutorProcessConfig {
     pub execution_engine: Option<Arc<dyn ExecutionEngine>>,
 }
 
+// What is needed in a executor
+// - Executor lifecycle management
+//     * identification
+//     * shutdown
+// - A connection to a cluster manager node, planner node, something like that
+// - A logging/tracing setup
+// - Node identifier
+// - Shuffle Service
+//
+pub struct ShuffleServiceConfig {
+    timeout: Duration,
+}
+
+impl ShuffleServiceConfig {
+    pub fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+impl Default for ShuffleServiceConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(20),
+        }
+    }
+}
+
+
+
+pub struct ShuffleService {
+    config: ShuffleServiceConfig,
+}
+
+impl ShuffleService {
+    pub fn new(config: ShuffleServiceConfig) -> Self {
+        Self { config }
+    }
+
+    pub async fn start_grpc_server(
+        &mut self,
+        addr: SocketAddr,
+        shutdown: &mut Shutdown,
+    ) -> Result<(), BallistaError> {
+        let ballista_service = BallistaFlightService::new();
+        let shuffle_service = FlightServiceServer::new(ballista_service);
+
+        info!("Ballista v{BALLISTA_VERSION} Starting ShuffleService listening on {addr}");
+        let server = Server::builder()
+            .timeout(self.config.timeout())
+            .tcp_nodelay(true)
+            .tcp_keepalive(Option::Some(Duration::from_secs(3600)))
+            .http2_keepalive_interval(Option::Some(Duration::from_secs(300)))
+            .http2_keepalive_timeout(Option::Some(Duration::from_secs(20)))
+            .add_service(shuffle_service)
+            .serve_with_shutdown(addr, shutdown.recv())
+            .await
+            .map_err(|e| {
+                error!("Could not start ShuffleService, due to a TonicError");
+                BallistaError::TonicError(e)
+            })?;
+
+        Ok(server)
+    }
+}
+
 pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
     let rust_log = env::var(EnvFilter::DEFAULT_ENV);
     let log_filter = EnvFilter::new(rust_log.unwrap_or(opt.special_mod_log_level));
@@ -130,9 +202,7 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
         .parse()
         .with_context(|| format!("Could not parse address: {addr}"))?;
 
-    let scheduler_host = opt.scheduler_host;
-    let scheduler_port = opt.scheduler_port;
-    let scheduler_url = format!("http://{scheduler_host}:{scheduler_port}");
+
 
     let work_dir = opt.work_dir.unwrap_or(
         TempDir::new()?
@@ -188,47 +258,16 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
         opt.execution_engine,
     ));
 
-    let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
-    let connection = if connect_timeout == 0 {
-        create_grpc_client_connection(scheduler_url)
-            .await
-            .context("Could not connect to scheduler")
-    } else {
-        // this feature was added to support docker-compose so that we can have the executor
-        // wait for the scheduler to start, or at least run for 10 seconds before failing so
-        // that docker-compose's restart policy will restart the container.
-        let start_time = Instant::now().elapsed().as_secs();
-        let mut x = None;
-        while x.is_none()
-            && Instant::now().elapsed().as_secs() - start_time < connect_timeout
-        {
-            match create_grpc_client_connection(scheduler_url.clone())
-                .await
-                .context("Could not connect to scheduler")
-            {
-                Ok(conn) => {
-                    info!("Connected to scheduler at {}", scheduler_url);
-                    x = Some(conn);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to connect to scheduler at {} ({}); retrying ...",
-                        scheduler_url, e
-                    );
-                    std::thread::sleep(time::Duration::from_millis(500));
-                }
-            }
-        }
-        match x {
-            Some(conn) => Ok(conn),
-            _ => Err(BallistaError::General(format!(
-                "Timed out attempting to connect to scheduler at {scheduler_url}"
-            ))
-            .into()),
-        }
-    }?;
+    // Connect to scheduler process
+    let scheduler_host = opt.scheduler_host;
+    let scheduler_port = opt.scheduler_port;
+    let scheduler_url = format!("http://{scheduler_host}:{scheduler_port}");
+    let connection_grace_period =
+        Duration::from_secs(opt.scheduler_connect_timeout_seconds as u64);
+    let connection = connect_to_scheduler(scheduler_url, connection_grace_period).await?;
+    let mut scheduler_client = SchedulerGrpcClient::new(connection);
 
-    let mut scheduler = SchedulerGrpcClient::new(connection);
+
 
     let default_codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> =
         BallistaCodec::default();
@@ -280,7 +319,7 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
             service_handlers.push(
                 //If there is executor registration error during startup, return the error and stop early.
                 executor_server::startup(
-                    scheduler.clone(),
+                    scheduler_client.clone(),
                     opt.bind_host,
                     executor.clone(),
                     default_codec,
@@ -292,7 +331,7 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
         }
         _ => {
             service_handlers.push(tokio::spawn(execution_loop::poll_loop(
-                scheduler.clone(),
+                scheduler_client.clone(),
                 executor.clone(),
                 default_codec,
             )));
@@ -336,7 +375,7 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
     if notify_scheduler {
         // Send a heartbeat to update status of executor to `Fenced`. This should signal to the
         // scheduler to no longer schedule tasks on this executor
-        if let Err(error) = scheduler
+        if let Err(error) = scheduler_client
             .heart_beat_from_executor(HeartBeatParams {
                 executor_id: executor_id.clone(),
                 metrics: vec![],
@@ -364,7 +403,7 @@ pub async fn start_executor_process(opt: ExecutorProcessConfig) -> Result<()> {
         }
 
         // TODO we probably don't need a separate rpc call for this....
-        if let Err(error) = scheduler
+        if let Err(error) = scheduler_client
             .executor_stopped(ExecutorStoppedParams {
                 executor_id,
                 reason: stop_reason,
@@ -549,6 +588,53 @@ pub async fn satisfy_dir_ttl(dir: DirEntry, ttl_seconds: u64) -> Result<bool> {
     }
 
     Ok(false)
+}
+
+async fn connect_to_scheduler(
+    scheduler_url: String,
+    grace_period: Duration,
+) -> Result<Channel, BallistaError> {
+    let endpoint = Endpoint::new(scheduler_url)?
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(20))
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(3600)))
+        .http2_keep_alive_interval(Duration::from_secs(300))
+        .keep_alive_timeout(Duration::from_secs(20))
+        .keep_alive_while_idle(true);
+
+    let scheduler_uri = endpoint.uri();
+    info!("Trying to connect to schedular at {scheduler_uri}");
+    let connection_start_time = Instant::now();
+    let mut connection = endpoint.connect().await.ok();
+
+    while connection.is_none() {
+        warn!("Failed to connect to scheduler at {scheduler_uri}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let time_used = Instant::now() - connection_start_time;
+        if time_used >= grace_period {
+            break;
+        }
+
+        info!(
+            "Retrying connection to scheduler ({}ms left)",
+            grace_period.as_millis() - time_used.as_millis()
+        );
+        connection = endpoint.connect().await.ok();
+    }
+
+    if let Some(channel) = connection {
+        info!("Connected succesfully to scheduler at {scheduler_uri}");
+        Ok(channel)
+    } else {
+        let msg = format!(
+            "Could not connect with schedular at {} within {}ms",
+            scheduler_uri,
+            grace_period.as_millis()
+        );
+        Err(BallistaError::General(msg))
+    }
 }
 
 #[cfg(test)]
