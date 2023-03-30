@@ -72,6 +72,7 @@ pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
         let permit = available_task_slots.acquire().await.unwrap();
         // Make the slot available again
         drop(permit);
+        // TD: looks ugly :( Is this the best way to do it? ^
 
         // Keeps track of whether we received task in last iteration
         // to avoid going in sleep mode between polling
@@ -278,6 +279,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     Ok(())
 }
 
+// TD: Should return Result?
 async fn sample_tasks_status(
     task_status_receiver: &mut Receiver<TaskStatus>,
 ) -> Vec<TaskStatus> {
